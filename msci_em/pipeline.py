@@ -370,10 +370,37 @@ def _clip_target(y: pd.Series, q: Optional[float]) -> pd.Series:
     return y.clip(lo, hi)
 
 
-def fit_predict(model_factory, X_train, y_train, X_test, cfg: Config) -> np.ndarray:
+def fit_model(model_factory, X_train, y_train, cfg: Config):
     m = model_factory()
     m.fit(X_train.values, _clip_target(y_train, cfg.target_clip_q).values)
+    return m
+
+
+def fit_predict(model_factory, X_train, y_train, X_test, cfg: Config) -> np.ndarray:
+    m = fit_model(model_factory, X_train, y_train, cfg)
     return np.asarray(m.predict(X_test.values), dtype=float)
+
+
+def model_weights(model, feat_cols: Sequence[str]) -> Optional[pd.DataFrame]:
+    """Feature weights of a fitted model, or None for models without any.
+
+    Ridge: coefficient in % of weight change when a stock moves from the
+    bottom to the top percentile of that feature (features are 0..1 ranks).
+    XGBoost: gain-based feature importance, normalised to sum to 100.
+    """
+    if isinstance(model, Ridge):
+        out = pd.DataFrame({"feature": list(feat_cols), "weight_%": model.coef_ * 100})
+        out = pd.concat([out, pd.DataFrame({"feature": ["intercept"],
+                                            "weight_%": [model.intercept_ * 100]})])
+    elif isinstance(model, XGBRegressor):
+        imp = model.get_booster().get_score(importance_type="gain")
+        vals = np.array([imp.get(f"f{i}", 0.0) for i in range(len(feat_cols))])
+        out = pd.DataFrame({"feature": list(feat_cols), "weight_%": vals / vals.sum() * 100})
+    else:
+        return None
+    out["abs"] = out["weight_%"].abs()
+    return (out.sort_values("abs", ascending=False).drop(columns="abs")
+            .reset_index(drop=True))
 
 
 # --------------------------------------------------------------------------
@@ -538,9 +565,10 @@ def final_forecast(train: pd.DataFrame, latest: pd.DataFrame, feat_cols: Sequenc
     models = make_models(cfg)
     covered = latest["has_features"].values
     pc = np.zeros(len(latest))
+    fitted = fit_model(models[winner], train[feat_cols], train["target"], cfg)
     if covered.any():
-        pc[covered] = fit_predict(models[winner], train[feat_cols], train["target"],
-                                  latest.loc[covered, feat_cols], cfg)
+        pc[covered] = np.asarray(fitted.predict(latest.loc[covered, feat_cols].values), float)
+    final_forecast.weights = model_weights(fitted, feat_cols)
     pw = predictions_to_weights(latest["weight"].values, pc)
     new_pred = pd.DataFrame({
         "stock": latest["stock"].values,
@@ -560,6 +588,9 @@ def final_forecast(train: pd.DataFrame, latest: pd.DataFrame, feat_cols: Sequenc
         print("Stage 9: final_forecast")
         print(f"  model: {winner} | base period: {latest['quarter'].iloc[0]} | stocks: {len(out)}"
               f" ({int(covered.sum())} modelled, {int((~covered).sum())} carried at current weight)")
+        if final_forecast.weights is not None:
+            print("  feature weights (% weight change, bottom -> top percentile):")
+            print(final_forecast.weights.round(2).to_string(index=False))
         print(out[["name", "current_weight", "predicted_weight", "low", "high"]].head(10).round(3).to_string())
     return out
 
@@ -594,9 +625,14 @@ def run_pipeline(path: str, cfg: Config = Config(), out_dir: Optional[str] = Non
                                 "current_weight", "predicted_weight", "low", "mid", "high",
                                 "predicted_change_%", "model"]]
         deliverable.to_csv(os.path.join(out_dir, "forecast_next_period.csv"), index=False)
+        weights = getattr(final_forecast, "weights", None)
+        if weights is not None:
+            weights.to_csv(os.path.join(out_dir, "model_weights.csv"), index=False)
         with pd.ExcelWriter(os.path.join(out_dir, "forecast_next_period.xlsx")) as xw:
             deliverable.to_excel(xw, sheet_name="forecast", index=False)
             summary.reset_index().to_excel(xw, sheet_name="model_comparison", index=False)
+            if weights is not None:
+                weights.to_excel(xw, sheet_name="model_weights", index=False)
         if verbose:
             print(f"outputs written to {out_dir}/")
     return result
