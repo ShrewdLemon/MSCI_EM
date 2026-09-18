@@ -27,8 +27,9 @@ import numpy as np
 import pandas as pd
 
 from msci_em.pipeline import (Config, attach_target, build_features, derive_basics,
-                              fit_predict, load_and_clean, make_models, period_labels,
-                              predictions_to_weights, simulate_range, walk_forward)
+                              fit_model, load_and_clean, make_models, model_weights,
+                              period_labels, predictions_to_weights, simulate_range,
+                              walk_forward)
 
 
 def parse_args():
@@ -91,14 +92,14 @@ def main():
     if not can_model:
         print("  -> no training data exists before the base period: only the naive "
               "forecast (carry weights forward) is possible here.")
-    rows, changes = [], {}
+    rows, changes, fitted = [], {}, {}
     for name, factory in models.items():
         if name != "naive" and not can_model:
             continue
         pc = np.zeros(len(base))
         if name != "naive":
-            pc[covered] = fit_predict(factory, train[feat_cols], train["target"],
-                                      base.loc[covered, feat_cols], cfg)
+            fitted[name] = fit_model(factory, train[feat_cols], train["target"], cfg)
+            pc[covered] = np.asarray(fitted[name].predict(base.loc[covered, feat_cols].values), float)
         pw = predictions_to_weights(base["weight"].values, pc)
         changes[name] = (pc, pw)
         err = pw - base["actual_weight"].values
@@ -114,6 +115,10 @@ def main():
     if chosen != a.model:
         print(f"\n  model {a.model!r} unavailable here; detailed table uses naive")
     pc, pw = changes[chosen]
+    weights = model_weights(fitted[chosen], feat_cols) if chosen in fitted else None
+    if weights is not None:
+        print(f"\nFeature weights of {chosen} (% weight change, bottom -> top percentile):")
+        print(weights.round(2).to_string(index=False))
     detail = pd.DataFrame({
         "stock": base["stock"].values, "name": base["name"].values,
         "ticker": base["ticker"].values, "country": base["country"].values,
@@ -154,6 +159,8 @@ def main():
     with pd.ExcelWriter(os.path.join(a.out, f"{tag}.xlsx")) as xw:
         detail.to_excel(xw, sheet_name="stocks", index=False)
         table.reset_index().to_excel(xw, sheet_name="model_scores", index=False)
+        if weights is not None:
+            weights.to_excel(xw, sheet_name="model_weights", index=False)
     print(f"\nwritten: {a.out}/{tag}.csv and .xlsx")
 
 
