@@ -82,6 +82,9 @@ class Config:
     lags: Tuple[int, ...] = (1, 2)
     vol_window: int = 4
     vol_min_periods: int = 2
+    #: set False to drop the volatility feature (it needs vol_min_periods
+    #: past returns, which costs one extra period of history)
+    use_vol: bool = True
     #: clip the *training* target to these quantiles (fit on training data
     #: only) so a handful of 10x weight jumps don't dominate the fit
     target_clip_q: Optional[float] = 0.01
@@ -270,9 +273,10 @@ def build_features(df: pd.DataFrame, cfg: Config = Config(),
         out[f"share_chg_{k}"] = out["shares"] / g["shares"].shift(k) - 1
         raw_feats += [f"rel_return_{k}", f"share_chg_{k}"]
 
-    out["rel_vol"] = g["rel_return"].transform(
-        lambda s: s.rolling(cfg.vol_window, min_periods=cfg.vol_min_periods).std())
-    raw_feats.append("rel_vol")
+    if cfg.use_vol:
+        out["rel_vol"] = g["rel_return"].transform(
+            lambda s: s.rolling(cfg.vol_window, min_periods=cfg.vol_min_periods).std())
+        raw_feats.append("rel_vol")
 
     # size rank within period: 1 = largest market value
     out["size_rank"] = out.groupby("quarter_idx")["market_value"].rank(
@@ -297,6 +301,15 @@ def build_features(df: pd.DataFrame, cfg: Config = Config(),
 # Stage 4: target
 # --------------------------------------------------------------------------
 
+def attach_target(df: pd.DataFrame, feat_cols: Sequence[str]) -> pd.DataFrame:
+    """Full panel with ``target``, ``next_weight`` and ``has_features`` added."""
+    out = df.copy()
+    out["target"] = out.groupby("stock")["weight"].shift(-1) / out["weight"] - 1
+    out["next_weight"] = out.groupby("stock")["weight"].shift(-1)
+    out["has_features"] = out[list(feat_cols)].notna().all(axis=1)
+    return out
+
+
 def build_target(df: pd.DataFrame, feat_cols: Sequence[str],
                  verbose: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Stage 4.
@@ -305,15 +318,10 @@ def build_target(df: pd.DataFrame, feat_cols: Sequence[str],
     ``(train_df, latest_df)``: rows with features+target, and the last period's
     rows (features but no target) kept aside for the final forecast.
     """
-    out = df.copy()
-    out["target"] = out.groupby("stock")["weight"].shift(-1) / out["weight"] - 1
-    out["next_weight"] = out.groupby("stock")["weight"].shift(-1)
-
+    out = attach_target(df, feat_cols)
     has_row = out["weight"].notna()
-    has_feats = out[list(feat_cols)].notna().all(axis=1)
+    has_feats = out["has_features"]
     last_idx = out["quarter_idx"].max()
-
-    out["has_features"] = has_feats
     train = out[has_row & has_feats & out["target"].notna()].copy()
     # every stock in the last period; those without features are carried at
     # their current weight (naive) in the final forecast
@@ -384,17 +392,26 @@ def predictions_to_weights(current_weight: np.ndarray, pred_change: np.ndarray) 
 # Stage 7: walk-forward
 # --------------------------------------------------------------------------
 
+def period_labels(df: pd.DataFrame) -> Dict[int, str]:
+    """quarter_idx -> sheet label, from any frame that carries both columns."""
+    return df.drop_duplicates("quarter_idx").set_index("quarter_idx")["quarter"].to_dict()
+
+
 def walk_forward(train: pd.DataFrame, feat_cols: Sequence[str], cfg: Config = Config(),
-                 verbose: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+                 verbose: bool = True, labels: Optional[Dict[int, str]] = None,
+                 ) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
     """Stage 7.
 
     For each period t: fit on rows with quarter_idx <= t (their targets are
     realised at t+1), predict the rows at t+1 (whose targets realise at t+2)
     and score the resulting weights against the actual t+2 weights.
 
-    Returns ``(summary, predictions, winner)``.
+    Returns ``(summary, predictions, winner)``.  ``labels`` maps quarter_idx
+    to its sheet label for every period in the file (the training frame lacks
+    the last one); it is used to name the fold by the period being forecast.
     """
     models = make_models(cfg)
+    labels = {**period_labels(train), **(labels or {})}
     periods = np.sort(train["quarter_idx"].unique())
     preds: List[pd.DataFrame] = []
 
@@ -406,20 +423,22 @@ def walk_forward(train: pd.DataFrame, feat_cols: Sequence[str], cfg: Config = Co
             continue
         # actual next-period weights, rescaled over the scored universe
         actual_w = te["next_weight"].values / te["next_weight"].sum() * 100.0
+        forecast_q = labels.get(t_next + 1, f"after {labels[t_next]}")
         for name, factory in models.items():
             pc = fit_predict(factory, tr[feat_cols], tr["target"], te[feat_cols], cfg)
             pw = predictions_to_weights(te["weight"].values, pc)
             preds.append(pd.DataFrame({
                 "model": name, "train_upto": t, "test_quarter_idx": t_next,
-                "test_quarter": te["quarter"].values, "stock": te["stock"].values,
+                "test_quarter": te["quarter"].values, "forecast_quarter": forecast_q,
+                "stock": te["stock"].values,
                 "current_weight": te["weight"].values, "pred_change": pc,
                 "pred_weight": pw, "actual_weight": actual_w,
                 "abs_err": np.abs(pw - actual_w),
             }))
 
     predictions = pd.concat(preds, ignore_index=True)
-    per_fold = (predictions.groupby(["model", "test_quarter"], sort=False)["abs_err"]
-                .mean().unstack("test_quarter"))
+    per_fold = (predictions.groupby(["model", "forecast_quarter"], sort=False)["abs_err"]
+                .mean().unstack("forecast_quarter"))
     summary = per_fold.copy()
     summary["mean_mae"] = per_fold.mean(axis=1)
     summary["folds"] = per_fold.notna().sum(axis=1)
@@ -431,7 +450,7 @@ def walk_forward(train: pd.DataFrame, feat_cols: Sequence[str], cfg: Config = Co
     winner = best if summary.loc[best, "mean_mae"] < naive_mae else "naive"
 
     if verbose:
-        print("Stage 7: walk_forward")
+        print("Stage 7: walk_forward  (columns = period being forecast; MAE in weight points)")
         print(summary.round(5).to_string())
         print(f"  winner: {winner}")
     return summary, predictions, winner
@@ -555,7 +574,8 @@ def run_pipeline(path: str, cfg: Config = Config(), out_dir: Optional[str] = Non
     basics = derive_basics(long, verbose)
     feats, feat_cols = build_features(basics, cfg, verbose)
     train, latest = build_target(feats, feat_cols, verbose)
-    summary, predictions, winner = walk_forward(train, feat_cols, cfg, verbose)
+    summary, predictions, winner = walk_forward(train, feat_cols, cfg, verbose,
+                                                labels=period_labels(feats))
     forecast = final_forecast(train, latest, feat_cols, predictions, winner, cfg, verbose)
 
     result = dict(input_long=long, panel=feats, feat_cols=feat_cols, train=train,

@@ -8,6 +8,7 @@ ahead, with a low / high range, from the holdings history in
 pip install -r requirements.txt
 python run_pipeline.py                 # defaults: lags 1 and 2, 1000 sims
 python run_pipeline.py --lags 1        # sensitivity: lag-1 features only
+python backtest.py --forecast Dec-24 --lags 1 --no-vol   # backtest one period
 python -m pytest -q tests              # no-look-ahead + rescaling checks
 ```
 
@@ -70,8 +71,8 @@ Design choices worth knowing:
 
 ## Results on this file
 
-Walk-forward MAE in weight points, averaged over the two scorable periods
-(predicting Dec-24 and Dec-25):
+Walk-forward MAE in weight points, averaged over the two scorable folds
+(forecasting Dec-25 from Dec-24 features, and Aug-26 from Dec-25 features):
 
 | model | mean MAE | vs naive |
 |---|---|---|
@@ -84,6 +85,35 @@ Ridge beats naive by about one percent, XGBoost does not. With only two
 scorable periods this is a thin margin, so treat the model as a mild tilt
 around the carry-forward baseline rather than a strong signal. The lag-1
 sensitivity run gives the same ordering.
+
+## Backtesting a single period (`backtest.py`)
+
+`python backtest.py --forecast <sheet>` forecasts a period that is already in
+the file using only information available before it, then compares with the
+actual weights. It prints a score table for every model, the largest stocks
+and the biggest misses, and writes `output/backtest_<sheet>.csv` / `.xlsx`
+(sheet `stocks` has one row per stock with current, predicted and actual
+weight; sheet `model_scores` has the MAE table).
+
+What each period can honestly support with six annual snapshots:
+
+| forecast | base | training rows available before base | what runs |
+|---|---|---|---|
+| Dec-23 | Dec-22 | none (Dec-21 rows have no lagged features) | naive only |
+| Dec-24 | Dec-23 | Dec-22 rows, lag-1 features only (`--lags 1 --no-vol`) | all models, no band |
+| Dec-25 | Dec-24 | Dec-23 rows (default features) | all models, no band |
+| Aug-26 | Dec-25 | Dec-23 and Dec-24 rows | all models, with p5/p95 band |
+
+`--in-sample` trains on every usable period, including ones after the
+forecast. That is a look-ahead, so it shows the fitted tilt but is not
+evidence of skill; the output file name carries `_in_sample`. Even
+in-sample, Dec-23 needs `--lags 1 --no-vol` because the Dec-22 rows have
+only one period of history.
+
+Results on this file: the naive carry-forward scores an MAE of 0.0225
+weight points on Dec-23, ridge beats naive by 0.6 % on Dec-24 and by 1.3 %
+on average across the two later folds. The in-sample Dec-23 fit is slightly
+worse than naive, which is the honest reading: the model's edge is small.
 
 ## Outputs (`output/`)
 
