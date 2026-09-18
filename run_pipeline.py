@@ -10,11 +10,12 @@ def main():
     ap.add_argument("--out", default="output")
     ap.add_argument("--lags", type=int, nargs="+", default=[1, 2],
                     help="lag lengths (periods) for return / share-change features")
+    ap.add_argument("--no-vol", action="store_true", help="drop the volatility feature")
     ap.add_argument("--n-sims", type=int, default=1000)
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
-    cfg = Config(lags=tuple(args.lags), n_sims=args.n_sims)
+    cfg = Config(lags=tuple(args.lags), n_sims=args.n_sims, use_vol=not args.no_vol)
     run_pipeline(args.input, cfg=cfg, out_dir=args.out, verbose=not args.quiet)
 
 
